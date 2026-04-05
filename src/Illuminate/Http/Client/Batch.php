@@ -265,93 +265,94 @@ class Batch
     public function send(): array
     {
         $this->inProgress = true;
-
-        if ($this->beforeCallback !== null) {
-            call_user_func($this->beforeCallback, $this);
-        }
-
         $results = [];
 
-        if (! empty($this->requests)) {
-            $eachPromiseOptions = [
-                'fulfilled' => function ($result, $key) use (&$results) {
-                    $results[$key] = $result;
+        try {
+            if ($this->beforeCallback !== null) {
+                call_user_func($this->beforeCallback, $this);
+            }
 
-                    $this->decrementPendingRequests();
+            if (! empty($this->requests)) {
+                $eachPromiseOptions = [
+                    'fulfilled' => function ($result, $key) use (&$results) {
+                        $results[$key] = $result;
 
-                    if ($result instanceof Response && $result->successful()) {
-                        if ($this->progressCallback !== null) {
-                            call_user_func($this->progressCallback, $this, $key, $result);
+                        $this->decrementPendingRequests();
+
+                        if ($result instanceof Response && $result->successful()) {
+                            if ($this->progressCallback !== null) {
+                                call_user_func($this->progressCallback, $this, $key, $result);
+                            }
+
+                            return $result;
+                        }
+
+                        if (
+                            ($result instanceof Response && $result->failed()) ||
+                            $result instanceof RequestException ||
+                            $result instanceof ConnectionException
+                        ) {
+                            $this->incrementFailedRequests();
+
+                            if ($this->catchCallback !== null) {
+                                call_user_func($this->catchCallback, $this, $key, $result);
+                            }
                         }
 
                         return $result;
-                    }
+                    },
+                    'rejected' => function ($reason, $key) {
+                        $this->decrementPendingRequests();
 
-                    if (
-                        ($result instanceof Response && $result->failed()) ||
-                        $result instanceof RequestException ||
-                        $result instanceof ConnectionException
-                    ) {
-                        $this->incrementFailedRequests();
+                        if ($reason instanceof RequestException || $reason instanceof ConnectionException) {
+                            $this->incrementFailedRequests();
 
-                        if ($this->catchCallback !== null) {
-                            call_user_func($this->catchCallback, $this, $key, $result);
+                            if ($this->catchCallback !== null) {
+                                call_user_func($this->catchCallback, $this, $key, $reason);
+                            }
                         }
+
+                        return $reason;
+                    },
+                ];
+
+                if ($this->concurrencyLimit !== null) {
+                    $eachPromiseOptions['concurrency'] = $this->concurrencyLimit;
+                }
+
+                $promiseGenerator = function () {
+                    foreach ($this->requests as $key => $item) {
+                        $promise = $item instanceof PendingRequest ? $item->getPromise() : $item;
+                        yield $key => $promise instanceof LazyPromise ? $promise->buildPromise() : $promise;
                     }
+                };
 
-                    return $result;
-                },
-                'rejected' => function ($reason, $key) {
-                    $this->decrementPendingRequests();
-
-                    if ($reason instanceof RequestException || $reason instanceof ConnectionException) {
-                        $this->incrementFailedRequests();
-
-                        if ($this->catchCallback !== null) {
-                            call_user_func($this->catchCallback, $this, $key, $reason);
-                        }
-                    }
-
-                    return $reason;
-                },
-            ];
-
-            if ($this->concurrencyLimit !== null) {
-                $eachPromiseOptions['concurrency'] = $this->concurrencyLimit;
+                (new EachPromise($promiseGenerator(), $eachPromiseOptions))
+                    ->promise()
+                    ->wait();
             }
 
-            $promiseGenerator = function () {
-                foreach ($this->requests as $key => $item) {
-                    $promise = $item instanceof PendingRequest ? $item->getPromise() : $item;
-                    yield $key => $promise instanceof LazyPromise ? $promise->buildPromise() : $promise;
-                }
-            };
+            // Before returning the results, we must ensure that the results are sorted
+            // in the same order as the requests were defined, respecting any custom
+            // key names that were assigned to this request using the "as" method.
+            uksort($results, function ($key1, $key2) {
+                return array_search($key1, array_keys($this->requests), true) <=>
+                    array_search($key2, array_keys($this->requests), true);
+            });
 
-            (new EachPromise($promiseGenerator(), $eachPromiseOptions))
-                ->promise()
-                ->wait();
+            if (! $this->hasFailures() && $this->thenCallback !== null) {
+                call_user_func($this->thenCallback, $this, $results);
+            }
+
+            if ($this->finallyCallback !== null) {
+                call_user_func($this->finallyCallback, $this, $results);
+            }
+
+            return $results;
+        } finally {
+            $this->finishedAt = new CarbonImmutable;
+            $this->inProgress = false;
         }
-
-        // Before returning the results, we must ensure that the results are sorted
-        // in the same order as the requests were defined, respecting any custom
-        // key names that were assigned to this request using the "as" method.
-        uksort($results, function ($key1, $key2) {
-            return array_search($key1, array_keys($this->requests), true) <=>
-                   array_search($key2, array_keys($this->requests), true);
-        });
-
-        if (! $this->hasFailures() && $this->thenCallback !== null) {
-            call_user_func($this->thenCallback, $this, $results);
-        }
-
-        if ($this->finallyCallback !== null) {
-            call_user_func($this->finallyCallback, $this, $results);
-        }
-
-        $this->finishedAt = new CarbonImmutable;
-        $this->inProgress = false;
-
-        return $results;
     }
 
     /**
